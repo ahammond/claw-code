@@ -19,6 +19,13 @@ pub use prompt_cache::{
     PromptCacheStats,
 };
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
+#[cfg(feature = "bedrock")]
+pub use providers::bedrock::{
+    discover_callable_models, discover_models, filter_to_latest_versions,
+    invalidate_discovery_cache, load_aws_config, model_family, probe_model_callable,
+    register_bedrock_aliases, resolve_bedrock_alias, strip_bedrock_prefix, BedrockClient,
+    DiscoveredModel, MessageStream as BedrockMessageStream,
+};
 pub use providers::openai_compat::{
     build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,
     model_rejects_is_error_field, translate_message, OpenAiCompatClient, OpenAiCompatConfig,

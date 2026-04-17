@@ -8,6 +8,8 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+#[cfg(feature = "bedrock")]
+pub mod bedrock;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -33,6 +35,7 @@ pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
+    Bedrock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +139,15 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
 #[must_use]
 pub fn resolve_model_alias(model: &str) -> String {
     let trimmed = model.trim();
+
+    // Check dynamic Bedrock alias registry first (populated after discovery)
+    #[cfg(feature = "bedrock")]
+    if trimmed.starts_with("bedrock/") {
+        if let Some(resolved) = bedrock::resolve_bedrock_alias(trimmed) {
+            return resolved;
+        }
+    }
+
     let lower = trimmed.to_ascii_lowercase();
     MODEL_REGISTRY
         .iter()
@@ -157,6 +169,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "kimi" => "kimi-k2.5",
                     _ => trimmed,
                 },
+                ProviderKind::Bedrock => trimmed,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -214,6 +227,18 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             auth_env: "DASHSCOPE_API_KEY",
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        });
+    }
+    // AWS Bedrock: models prefixed with "bedrock/" route to the Bedrock
+    // backend. Auth is resolved through the standard AWS credential chain
+    // (env vars, profiles, instance roles) — `auth_env` names the most
+    // common explicit env var for error-message purposes only.
+    if canonical.starts_with("bedrock/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::Bedrock,
+            auth_env: "AWS_ACCESS_KEY_ID",
+            base_url_env: "AWS_BEDROCK_ENDPOINT_URL",
+            default_base_url: "https://bedrock-runtime.us-east-1.amazonaws.com",
         });
     }
     None
@@ -352,6 +377,11 @@ const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
         "DASHSCOPE_API_KEY",
         "Alibaba DashScope",
         "prefix your model name with `qwen/` or `qwen-` (e.g. `--model qwen-plus`) so prefix routing selects the DashScope backend",
+    ),
+    (
+        "AWS_ACCESS_KEY_ID",
+        "AWS Bedrock",
+        "prefix your model name with `bedrock/` (e.g. `--model bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0`) so prefix routing selects the Bedrock backend",
     ),
 ];
 
@@ -608,6 +638,96 @@ mod tests {
     fn kimi_alias_resolves_to_kimi_k2_5() {
         assert_eq!(super::resolve_model_alias("kimi"), "kimi-k2.5");
         assert_eq!(super::resolve_model_alias("KIMI"), "kimi-k2.5"); // case insensitive
+    }
+
+    #[test]
+    fn bedrock_prefix_routes_to_bedrock_provider() {
+        let meta = super::metadata_for_model("bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0")
+            .expect("bedrock/ prefix must resolve to Bedrock metadata");
+        assert_eq!(meta.provider, ProviderKind::Bedrock);
+        assert_eq!(meta.auth_env, "AWS_ACCESS_KEY_ID");
+
+        // detect_provider_kind must agree
+        let kind = detect_provider_kind("bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0");
+        assert_eq!(
+            kind,
+            ProviderKind::Bedrock,
+            "bedrock/ prefix must route to Bedrock regardless of other env vars"
+        );
+    }
+
+    #[test]
+    fn bedrock_prefix_is_not_resolved_as_alias() {
+        // bedrock/ prefixed model names should pass through resolve_model_alias
+        // unchanged — they are not short aliases.
+        let resolved = resolve_model_alias("bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0");
+        assert_eq!(
+            resolved,
+            "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0"
+        );
+    }
+
+    #[test]
+    fn bedrock_alias_resolves_after_registration() {
+        // Simulate discovery + alias registration
+        #[cfg(feature = "bedrock")]
+        {
+            use super::bedrock::{register_bedrock_aliases, DiscoveredModel};
+
+            let models = vec![DiscoveredModel {
+                model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0".to_string(),
+                provider_name: "Anthropic".to_string(),
+                model_name: "Sonnet".to_string(),
+                is_inference_profile: false,
+            }];
+            register_bedrock_aliases(&models);
+
+            let resolved = resolve_model_alias("bedrock/sonnet");
+            assert_eq!(
+                resolved, "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
+                "bedrock/sonnet should resolve to the discovered model"
+            );
+
+            // The resolved alias should still route to Bedrock
+            assert_eq!(
+                detect_provider_kind(&resolved),
+                ProviderKind::Bedrock,
+                "resolved bedrock alias should still route to Bedrock"
+            );
+        }
+    }
+
+    #[test]
+    fn bedrock_does_not_sniff_credentials_in_fallback() {
+        // Per FR-6: Bedrock must always be selected explicitly via prefix.
+        // Even if AWS credentials are present, unrecognized model names
+        // should NOT route to Bedrock.
+        let _lock = env_lock();
+        let _aws = EnvVarGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAIOSFODNN7EXAMPLE"));
+        let _aws_secret = EnvVarGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));
+        let _anthropic = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+        let _anthropic_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _openai_base = EnvVarGuard::set("OPENAI_BASE_URL", None);
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+
+        let kind = detect_provider_kind("some-unknown-model");
+        assert_ne!(
+            kind,
+            ProviderKind::Bedrock,
+            "unknown model with AWS credentials present must NOT auto-route to Bedrock (FR-6)"
+        );
+    }
+
+    #[test]
+    fn bedrock_prefix_case_sensitive() {
+        // bedrock/ prefix is case-sensitive — "Bedrock/" or "BEDROCK/" should
+        // NOT route to the Bedrock provider.
+        assert!(
+            super::metadata_for_model("Bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0")
+                .is_none(),
+            "uppercase Bedrock/ should not match"
+        );
     }
 
     #[test]
@@ -994,6 +1114,34 @@ NO_EQUALS_LINE
         assert!(
             hint.contains("qwen"),
             "hint should suggest a qwen-prefixed model alias: {hint}"
+        );
+    }
+
+    #[test]
+    fn anthropic_missing_credentials_hint_detects_aws_access_key_id() {
+        // given
+        let _lock = env_lock();
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _aws = EnvVarGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAIOSFODNN7EXAMPLE"));
+
+        // when
+        let hint = anthropic_missing_credentials_hint()
+            .expect("AWS_ACCESS_KEY_ID presence should produce a hint");
+
+        // then
+        assert!(
+            hint.contains("AWS_ACCESS_KEY_ID is set"),
+            "hint should name AWS_ACCESS_KEY_ID: {hint}"
+        );
+        assert!(
+            hint.contains("Bedrock"),
+            "hint should identify the Bedrock provider: {hint}"
+        );
+        assert!(
+            hint.contains("bedrock/"),
+            "hint should suggest the bedrock/ prefix: {hint}"
         );
     }
 

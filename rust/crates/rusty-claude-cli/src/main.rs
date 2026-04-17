@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use api::BedrockClient;
 use api::{
     detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
@@ -1597,6 +1598,7 @@ fn provider_label(kind: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Xai => "xai",
         ProviderKind::OpenAi => "openai",
+        ProviderKind::Bedrock => "bedrock",
     }
 }
 
@@ -7459,6 +7461,11 @@ impl AnthropicRuntimeClient {
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
         let resolved_model = api::resolve_model_alias(&model);
+        // For Bedrock short aliases (e.g. "bedrock/sonnet"), we need to run
+        // async discovery before the alias registry is populated. We resolve
+        // the final model string here so the stored `model` field and every
+        // subsequent `MessageRequest` use the canonical Bedrock model ID.
+        let mut final_model = model;
         let client = match detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => {
                 let auth = resolve_cli_auth_source()?;
@@ -7480,12 +7487,45 @@ impl AnthropicRuntimeClient {
                 // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
                 ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
             }
+            ProviderKind::Bedrock => {
+                // Bedrock client construction is async (AWS credential
+                // resolution may hit the network). We spin up a temporary
+                // Tokio runtime here because the struct's own runtime is
+                // built *after* this match. The temp runtime is created and
+                // fully dropped before `Self { runtime: ... }` is built,
+                // so there is no nesting issue.
+                //
+                // Alias resolution is lazy: we only run `ListFoundationModels`
+                // when the bare model ID looks like a short alias (no "." —
+                // full Bedrock IDs always contain at least one "."). This
+                // avoids the startup overhead for users who specify an
+                // explicit model ID.
+                let temp_rt = tokio::runtime::Runtime::new()?;
+                let (bedrock_client, resolved) = temp_rt.block_on(async {
+                    let config = api::load_aws_config().await;
+                    let bare = final_model.strip_prefix("bedrock/").unwrap_or(&final_model);
+                    let resolved = if !bare.contains('.') && !bare.contains(':') {
+                        // Short alias — run discovery so the registry is
+                        // populated before we resolve.
+                        let models = api::discover_models(&config).await;
+                        let filtered = api::filter_to_latest_versions(models);
+                        api::register_bedrock_aliases(&filtered);
+                        api::resolve_model_alias(&final_model)
+                    } else {
+                        final_model.clone()
+                    };
+                    let client = BedrockClient::from_config(&config);
+                    (client, resolved)
+                });
+                final_model = resolved;
+                ApiProviderClient::from_bedrock_client(bedrock_client)
+            }
         };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
-            model,
+            model: final_model,
             enable_tools,
             emit_output,
             allowed_tools,
@@ -7504,6 +7544,7 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_cli_auth_source_for_cwd()?)
 }
 
+#[allow(clippy::result_large_err)]
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }

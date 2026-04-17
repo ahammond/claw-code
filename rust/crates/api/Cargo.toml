@@ -5,7 +5,14 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = ["bedrock"]
+bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:aws-sdk-bedrock"]
+
 [dependencies]
+aws-config = { version = "1", optional = true }
+aws-sdk-bedrock = { version = "1", optional = true }
+aws-sdk-bedrockruntime = { version = "1", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 runtime = { path = "../runtime" }
 serde = { version = "1", features = ["derive"] }
@@ -15,6 +22,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+mock-bedrock-service = { path = "../mock-bedrock-service" }
 
 [lints]
 workspace = true

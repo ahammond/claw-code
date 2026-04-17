@@ -1,6 +1,8 @@
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
+#[cfg(feature = "bedrock")]
+use crate::providers::bedrock::{self, BedrockClient};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
@@ -11,11 +13,22 @@ pub enum ProviderClient {
     Anthropic(AnthropicClient),
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
+    #[cfg(feature = "bedrock")]
+    Bedrock(BedrockClient),
 }
 
 impl ProviderClient {
     pub fn from_model(model: &str) -> Result<Self, ApiError> {
         Self::from_model_with_anthropic_auth(model, None)
+    }
+
+    /// Construct a `ProviderClient` from a pre-built `BedrockClient`. Used
+    /// by tests and by the CLI's Bedrock startup path (which must run async
+    /// credential resolution and optional discovery before calling this).
+    #[cfg(feature = "bedrock")]
+    #[must_use]
+    pub fn from_bedrock_client(client: BedrockClient) -> Self {
+        Self::Bedrock(client)
     }
 
     pub fn from_model_with_anthropic_auth(
@@ -43,6 +56,12 @@ impl ProviderClient {
                 };
                 Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
             }
+            ProviderKind::Bedrock => Err(ApiError::Auth(
+                "AWS Bedrock requires async initialization. Use the CLI's \
+                 `--model bedrock/<model-id>` flag — the runtime constructs \
+                 the Bedrock client asynchronously at startup."
+                    .to_string(),
+            )),
         }
     }
 
@@ -52,6 +71,8 @@ impl ProviderClient {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
             Self::OpenAi(_) => ProviderKind::OpenAi,
+            #[cfg(feature = "bedrock")]
+            Self::Bedrock(_) => ProviderKind::Bedrock,
         }
     }
 
@@ -59,6 +80,8 @@ impl ProviderClient {
     pub fn with_prompt_cache(self, prompt_cache: PromptCache) -> Self {
         match self {
             Self::Anthropic(client) => Self::Anthropic(client.with_prompt_cache(prompt_cache)),
+            #[cfg(feature = "bedrock")]
+            other @ Self::Bedrock(_) => other,
             other => other,
         }
     }
@@ -68,6 +91,8 @@ impl ProviderClient {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
             Self::Xai(_) | Self::OpenAi(_) => None,
+            #[cfg(feature = "bedrock")]
+            Self::Bedrock(_) => None,
         }
     }
 
@@ -76,6 +101,8 @@ impl ProviderClient {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
             Self::Xai(_) | Self::OpenAi(_) => None,
+            #[cfg(feature = "bedrock")]
+            Self::Bedrock(_) => None,
         }
     }
 
@@ -86,6 +113,8 @@ impl ProviderClient {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
             Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
+            #[cfg(feature = "bedrock")]
+            Self::Bedrock(client) => client.send_message(request).await,
         }
     }
 
@@ -102,6 +131,11 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
+            #[cfg(feature = "bedrock")]
+            Self::Bedrock(client) => client
+                .stream_message(request)
+                .await
+                .map(MessageStream::Bedrock),
         }
     }
 }
@@ -110,6 +144,8 @@ impl ProviderClient {
 pub enum MessageStream {
     Anthropic(anthropic::MessageStream),
     OpenAiCompat(openai_compat::MessageStream),
+    #[cfg(feature = "bedrock")]
+    Bedrock(bedrock::MessageStream),
 }
 
 impl MessageStream {
@@ -118,6 +154,8 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.request_id(),
             Self::OpenAiCompat(stream) => stream.request_id(),
+            #[cfg(feature = "bedrock")]
+            Self::Bedrock(stream) => stream.request_id(),
         }
     }
 
@@ -125,6 +163,8 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.next_event().await,
             Self::OpenAiCompat(stream) => stream.next_event().await,
+            #[cfg(feature = "bedrock")]
+            Self::Bedrock(stream) => stream.next_event().await,
         }
     }
 }
