@@ -4767,6 +4767,134 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Source.** Jobdori dogfood 2026-04-20 against `/tmp/claw-mcp-test` (env-cleaned, working `mcpServers.everything = npx -y @modelcontextprotocol/server-everything`) on main HEAD `8122029` in response to Clawhip dogfood nudge / 10-min cron. Joins **MCP lifecycle gap family** as runtime-side companion to **#102** — #102 catches config-time silence (no preflight, no command-exists check); #129 catches runtime-side blocking (handshake await ordered before cred check, retried silently, no deadline). Joins **Truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110, #112, #114, #115, #125, #127) — the hang surfaces no events, no exit code, no signal. Joins **Auth-precondition / fail-fast ordering family** — cheap deterministic preconditions should run before expensive externally-controlled ones. Cross-cluster with **Recovery / wedge-recovery** — a misbehaved MCP server wedges every subsequent Prompt invocation; current recovery is "kill -9 the parent." Cross-cluster with **PARITY.md Lane 7 acceptance gap** — the Lane 7 merge added the bridge but didn't add startup-deadline + cred-precheck ordering, so the lane is technically merged but functionally incomplete for unattended claw use. Natural bundle: **#102 + #129** — MCP lifecycle visibility pair: config-time preflight (#102) + runtime-time deadline + cred-precheck (#129). Together they make MCP failures structurally legible from both ends. Also **#127 + #129** — Prompt-path silent-failure pair: verb-suffix args silently routed to Prompt (#127, fixed) + Prompt path silently blocks on MCP (#129). With #127 fixed, the `claw doctor --json` consumer no longer accidentally trips the #129 wedge — but the wedge still affects every legitimate Prompt invocation. Session tally: ROADMAP #129.
 
+130. **`claw export --output <path>` filesystem errors surface raw OS errno strings with zero context — no path that failed, no operation that failed (open/write/mkdir), no structured error kind, no actionable hint, and the `--output-format json` envelope flattens everything to `{"error":"<raw errno string>","type":"error"}`. Five distinct filesystem failure modes all produce different raw errno strings but the same zero-context shape. The boilerplate `Run claw --help for usage` trailer is also misleading because these are filesystem errors, not usage errors** — dogfooded 2026-04-20 on main HEAD `d2a8341` from `/Users/yeongyu/clawd/claw-code/rust` (real session file present).
+
+     **Concrete repro.**
+     ```
+     # (1) Nonexistent intermediate directory:
+     $ claw export --output /tmp/nonexistent/dir/out.md
+     error: No such file or directory (os error 2)
+     Run `claw --help` for usage.
+     exit=1
+     # No mention of /tmp/nonexistent/dir/out.md. No hint that the intermediate
+     # directory /tmp/nonexistent/dir/ doesn't exist. No suggestion to mkdir -p.
+
+     # (2) Read-only location:
+     $ claw export --output /bin/cantwrite.md
+     error: Operation not permitted (os error 1)
+     Run `claw --help` for usage.
+     exit=1
+     # No mention of /bin/cantwrite.md. No hint about permissions.
+
+     # (3) Empty --output value:
+     $ claw export --output ""
+     error: No such file or directory (os error 2)
+     Run `claw --help` for usage.
+     exit=1
+     # Empty string got silently passed through to open(). The user has no way
+     # to know whether they typo'd --output or the target actually didn't exist.
+
+     # (4) --output / (root — directory-not-file):
+     $ claw export --output /
+     error: File exists (os error 17)
+     Run `claw --help` for usage.
+     exit=1
+     # File exists (os error 17) is especially confusing — / is a directory that
+     # exists, but the user asked to write a FILE there. The underlying errno
+     # is from open(O_EXCL) or rename() hitting a directory.
+
+     # (5) --output /tmp/ (trailing slash — is a dir):
+     $ claw export --output /tmp/
+     error: Is a directory (os error 21)
+     Run `claw --help` for usage.
+     exit=1
+     # Raw errno again. No hint that /tmp/ is a directory so the user should
+     # supply a FILENAME like /tmp/out.md.
+
+     # JSON envelope is equally context-free:
+     $ claw --output-format json export --output /tmp/nonexistent/dir/out.md
+     {"error":"No such file or directory (os error 2)","type":"error"}
+     # exit=1
+     # No path, no operation, no error kind, no hint. A claw parsing this has
+     # to regex the errno string. Downstream automation has no way to programmatically
+     # distinguish (1) from (2) from (3) from (4) from (5) other than string matching.
+
+     # Baseline (writable target works correctly):
+     $ claw export --output /tmp/out.md
+     Export
+       Result           wrote markdown transcript
+       File             /tmp/out.md
+     # exit=0, file created. So the failure path is where the signal is lost.
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs` (or wherever the `export` verb handler lives) likely has something like `fs::write(&output_path, &markdown).map_err(|e| e.to_string())?` — the `e.to_string()` discards the path, operation, and `io::ErrorKind`, emitting only the raw `io::Error` `Display` string.
+     - `rust/crates/rusty-claude-cli/src/main.rs` error envelope wrapper at the CLI boundary appends `Run claw --help for usage.` to every error unconditionally, including filesystem errors where `--help` is unrelated.
+     - JSON-envelope wrapper at the CLI boundary just takes the error string verbatim into `{"error":...}` without structuring it.
+     - Compare to `std::io::Error::kind()` which provides `ErrorKind::NotFound`, `ErrorKind::PermissionDenied`, `ErrorKind::IsADirectory`, `ErrorKind::AlreadyExists`, `ErrorKind::InvalidInput` — each maps cleanly to a structured error kind with a documented meaning.
+     - Compare to `anyhow::Context` / `with_context(|| format!("writing export to {}", path.display()))` — the Rust idiom for preserving filesystem context. The codebase uses `anyhow` elsewhere but apparently not here.
+
+     **Why this is specifically a clawability gap.**
+     1. *Raw errno = zero clawability.* A claw seeing `No such file or directory (os error 2)` has to either regex-scrape the string (brittle, platform-dependent) or retry-then-fail to figure out which path is the problem. With 5 different failure modes all producing different errno strings, the claw's error handler becomes an errno lookup table.
+     2. *Path is lost entirely.* The user provided `/tmp/nonexistent/dir/out.md` — that exact string should echo back in the error. Currently it's discarded. A claw invoking `claw export --output "$DEST"` in a loop can't tell which iteration's `$DEST` failed from the error alone.
+     3. *Operation is lost entirely.* `os error 2` could be from `open()`, `mkdir()`, `stat()`, `rename()`, or `realpath()`. The CLI knows which syscall failed (it's the one it called) but throws that info away.
+     4. *JSON envelope is a fake envelope.* `{"error":"<errno>","type":"error"}` is the SAME shape the cred-error path uses, the session-not-found path uses, the stale-base path uses, and this FS-error path uses. A claw consuming `--output-format json` has no way to distinguish filesystem-retry-worthy errors from authentication errors from parser errors from data-schema errors. Every error is `{"error":"<opaque string>","type":"error"}`.
+     5. *`Run claw --help for usage` trailer is misleading.* That trailer is for `error: unknown option: --foo` style usage errors. On filesystem errors it wastes operator/claw attention on the wrong runbook ("did I mistype a flag?" — no, the flag is fine, the FS target is bad).
+     6. *Empty-string `--output ""` not validated at parse time.* Joins #124 (`--model ""` accepted) and #128 (`--model` empty/malformed) — another flag that accepts the empty string and falls through to runtime failure.
+     7. *Errno 17 for `--output /` is confusing without unpacking.* `File exists (os error 17)` is the errno, but the user-facing meaning is "/ is a directory, not a file path." That translation should happen in the CLI, not be left to the operator to decode.
+     8. *Joins truth-audit / diagnostic-integrity* (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110, #112, #114, #115, #125, #127, #129) — the error surface is incomplete by design. The runtime has the information (path, operation, errno kind) but discards it at the CLI boundary.
+     9. *Joins #121 (hooks error "misleading").* Same pattern: the error text names the wrong thing. #121: `field "hooks.PreToolUse" must be an array of strings, got an array` — wrong diagnosis. #130: `No such file or directory (os error 2)` — silent about which file.
+     10. *Joins Phase 2 §4 Canonical lane event schema thesis.* Errors should be typed: `{kind: "export", error: {type: "fs.not_found", path: "/tmp/nonexistent/dir/out.md", operation: "write"}, hint: "intermediate directory does not exist; try mkdir -p"}`.
+
+     **Fix shape (~60 lines).**
+     1. *Wrap the `fs::write` call (or equivalent) with `anyhow::with_context(|| format!("writing export to {}", path.display()))` so the path is always preserved in the error chain.* ~5 lines.
+     2. *Classify `io::Error::kind()` into a typed enum for the export verb:*
+        ```rust
+        enum ExportFsError {
+            NotFound { path: PathBuf, intermediate_dir: Option<PathBuf> },
+            PermissionDenied { path: PathBuf },
+            IsADirectory { path: PathBuf },
+            InvalidPath { path: PathBuf, reason: String },
+            Other { path: PathBuf, errno: i32, kind: String },
+        }
+        ```
+        ~25 lines.
+     3. *Emit user-facing error text with path + actionable hint:*
+        - `NotFound` with intermediate_dir: `error: cannot write export to '/tmp/nonexistent/dir/out.md': intermediate directory '/tmp/nonexistent/dir' does not exist; run `mkdir -p /tmp/nonexistent/dir` first.`
+        - `PermissionDenied`: `error: cannot write export to '/bin/cantwrite.md': permission denied; choose a path you can write to.`
+        - `IsADirectory`: `error: cannot write export to '/tmp/': target is a directory; provide a filename like /tmp/out.md.`
+        - `InvalidPath` (empty string): `error: --output requires a non-empty path.`
+        ~15 lines.
+     4. *Remove the `Run claw --help for usage` trailer from filesystem errors.* The trailer is appropriate for usage errors only. Gate it on `error.is_usage_error()`. ~5 lines.
+     5. *Structure the JSON envelope:*
+        ```json
+        {
+          "kind": "export",
+          "error": {
+            "type": "fs.not_found",
+            "path": "/tmp/nonexistent/dir/out.md",
+            "operation": "write",
+            "intermediate_dir": "/tmp/nonexistent/dir"
+          },
+          "hint": "intermediate directory does not exist; try `mkdir -p /tmp/nonexistent/dir` first",
+          "type": "error"
+        }
+        ```
+        The top-level `type: "error"` stays for parser backward-compat; the new `error.type` subfield gives claws a switchable kind. ~10 lines.
+     6. *Regression tests.*
+        - (a) `claw export --output /tmp/nonexistent-dir-XXX/out.md` exits 1 with error text containing the path AND "intermediate directory does not exist."
+        - (b) Same with `--output-format json` emits `{kind:"export", error:{type:"fs.not_found", path:..., intermediate_dir:...}, hint:...}`.
+        - (c) `claw export --output /dev/null` still succeeds (device file write works; no regression).
+        - (d) `claw export --output /tmp/` exits 1 with error text containing "target is a directory."
+        - (e) `claw export --output ""` exits 1 with error text "--output requires a non-empty path."
+        - (f) No `Run claw --help for usage` trailer on any of (a)–(e).
+
+     **Acceptance.** `claw export --output <bad-path>` emits an error that contains the path, the operation, and an actionable hint. `--output-format json` surfaces a typed error structure with `error.type` switchable by claws. The `Run claw --help for usage` trailer is gone from filesystem errors. Empty-string `--output` is rejected at parse time.
+
+     **Blocker.** None. Pure error-routing work in the export verb handler. ~60 lines across `main.rs` and possibly `rust/crates/runtime/src/export.rs` if that's where the write happens.
+
+     **Source.** Jobdori dogfood 2026-04-20 against `/Users/yeongyu/clawd/claw-code/rust` (real session file present) on main HEAD `d2a8341` in response to Clawhip dogfood nudge / 10-min cron. Joins **Truth-audit / diagnostic-integrity** (#80–#127, #129) as 16th — error surface is incomplete by design; runtime has info that CLI boundary discards. Joins **JSON envelope asymmetry family** (#90, #91, #92, #110, #115, #116) — `{error, type}` shape is a fake envelope when the failure mode is richer than a single prose string. Joins **Claude Code migration parity** — Claude Code's error shape includes typed error kinds; claw-code's flat envelope loses information. Joins **`Run claw --help for usage` trailer-misuse** — the trailer is appended to errors that are not usage errors, which is both noise and misdirection. Natural bundle: **#90 + #91 + #92 + #130** — JSON envelope hygiene quartet. All four surface errors with insufficient structure for claws to dispatch on. Also **#121 + #130** — error-text-lies pair: hooks error names wrong thing (#121), export errno strips all context (#130). Also **Phase 2 §4 Canonical lane event schema exhibit A** — typed errors are the prerequisite for structured lane events. Session tally: ROADMAP #130.
+
      **Repro (fresh box, no ANTHROPIC_* env vars).** `claw --model "bad model" version` → exit 0, emits version JSON (silent parse). `claw --model "" version` → exit 0, same. `claw --model "foo bar/baz" prompt "test"` → exit 1, `error: missing Anthropic credentials` (malformed model silently routes to Anthropic, then cred error masquerades as root cause instead of "invalid model syntax").
 
      **The gap.** (1) No upfront model syntax validation in parse_args. `--model` accepts any string. (2) Silent fallback to Anthropic when provider detection fails on malformed syntax. (3) Downstream error misdirection — cred error doesn't say "your model string was invalid, I fell back to Anthropic." (4) Token burn on invalid model at API layer — with credentials set, malformed model reaches the API, billing tokens against a 400 response that should have been rejected client-side. (5) Joins #29 (provider routing silent fallback) — both involve Anthropic fallback masking the real intent. (6) Joins truth-audit — status/version JSON report malformed model without validation. (7) Joins cred-error misdirection family (#28, #99, #127).
