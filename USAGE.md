@@ -254,6 +254,19 @@ cd rust
 ./target/debug/claw --model "qwen2.5-coder" prompt "reply with the word ready"
 ```
 
+### LM Studio
+
+```bash
+export OPENAI_BASE_URL="http://localhost:1234/v1"
+export OPENAI_API_KEY="lm-studio"
+
+claw --model "openai/google/gemma-4-26b-a4b" prompt "summarize this repository"
+```
+
+LM Studio does not validate the API key — any non-empty string works. The `openai/` prefix selects the OpenAI-compatible provider; everything after the first `/` is sent to LM Studio as the model identifier. Multi-segment names (e.g. `openai/google/gemma-4-26b-a4b`) are supported.
+
+Use the model identifier exactly as it appears in LM Studio's **Local Models** tab.
+
 ### Ollama
 
 ```bash
